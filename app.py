@@ -299,7 +299,7 @@ def task_loop(session):
             with state_lock:
                 bot_state["task_status"] = msg
 
-            for _ in range(72000): # 7200s * 10
+            for _ in range(72100): # 7200s * 10
                 if stop_event.is_set():
                     return
                 time.sleep(0.1)
