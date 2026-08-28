@@ -44,6 +44,14 @@ COOLDOWN_SECONDS = 120
 LOGIN_REFRESH_MIN = 7 * 60   # 7 phút
 LOGIN_REFRESH_MAX = 10 * 60  # 10 phút
 
+# Danh sách 4 task
+TASK_LIST = [
+    "youtube_like_comment",
+    "twitter_retweet",
+    "website_visit",
+    "telegram_react_latest"
+]
+
 # Cấu hình runtime (cho phép hot reload không cần restart Render)
 runtime_config = {
     "INIT_DATA": os.environ.get("INIT_DATA", "").strip(),
@@ -65,6 +73,7 @@ bot_state = {
     "ban_level": 0,
     "last_login_refresh": None,
     "is_running": False,
+    "task_status": "Chưa chạy",
 }
 state_lock = threading.Lock()
 bot_thread = None
@@ -189,6 +198,95 @@ def activate_boost(session, init_data, device_id, tg_id, display_preview):
     return session.post(BASE_URL, headers=headers, params=params, json=body, timeout=10)
 
 
+def send_task_action(session, action, task_id):
+    """Hàm gửi request start_task hoặc claim_task"""
+    init_data = get_init_data()
+    device_id = get_device_id()
+    tg_id = parse_tg_id(init_data)
+
+    headers = dict(COMMON_HEADERS_TEMPLATE)
+    headers["X-Telegram-Init-Data"] = init_data
+    
+    tma_session = get_tma_session()
+    if tma_session:
+        headers["x-atf-tma-session"] = tma_session
+
+    body = {
+        "client_started_at": int(time.time()),
+        "device_id": device_id,
+        "initData": init_data,
+        "request_id": str(uuid.uuid4()),
+        "task_id": task_id,
+        "tg_id": str(tg_id) if tg_id is not None else "",
+    }
+    params = {"action": action, "t": str(int(time.time() * 1000))}
+    try:
+        resp = session.post(BASE_URL, headers=headers, params=params, json=body, timeout=10)
+        print(f"[TASK-{action.upper()}] task_id={task_id} status={resp.status_code}")
+        return resp
+    except Exception as e:
+        print(f"[TASK-{action.upper()}] Lỗi request task {task_id}: {e}")
+        return None
+
+
+def task_loop(session):
+    """Luồng phụ chạy tự động 4 task theo chu kỳ"""
+    while not stop_event.is_set():
+        # 1. Start 4 task (sau mỗi task nghỉ 4s)
+        for i, task_id in enumerate(TASK_LIST, start=1):
+            if stop_event.is_set():
+                return
+            msg = f"Đang START task {i}/4: {task_id}"
+            print(f"[AutoTask] {msg}")
+            with state_lock:
+                bot_state["task_status"] = msg
+            
+            send_task_action(session, "start_task", task_id)
+            
+            for _ in range(40): # Chờ 4 giây
+                if stop_event.is_set():
+                    return
+                time.sleep(0.1)
+
+        # 2. Chờ 60 giây trước khi claim
+        msg = "Đã start đủ 4 task, đang chờ 60 giây..."
+        print(f"[AutoTask] {msg}")
+        with state_lock:
+            bot_state["task_status"] = msg
+
+        for _ in range(600):
+            if stop_event.is_set():
+                return
+            time.sleep(0.1)
+
+        # 3. Claim 4 task (sau mỗi task nghỉ 4s)
+        for i, task_id in enumerate(TASK_LIST, start=1):
+            if stop_event.is_set():
+                return
+            msg = f"Đang CLAIM task {i}/4: {task_id}"
+            print(f"[AutoTask] {msg}")
+            with state_lock:
+                bot_state["task_status"] = msg
+
+            send_task_action(session, "claim_task", task_id)
+
+            for _ in range(40): # Chờ 4 giây
+                if stop_event.is_set():
+                    return
+                time.sleep(0.1)
+
+        # 4. Cooldown 15 phút (900s)
+        msg = "Đã claim 4 task thành công. Cooldown 15 phút..."
+        print(f"[AutoTask] {msg}")
+        with state_lock:
+            bot_state["task_status"] = msg
+
+        for _ in range(9000):
+            if stop_event.is_set():
+                return
+            time.sleep(0.1)
+
+
 def login_refresh_loop(session, init_data, device_id, tg_id):
     """CHỈ làm mới login định kỳ 7-10 phút/lần."""
     while not stop_event.is_set():
@@ -246,6 +344,13 @@ def bot_loop():
     threading.Thread(
         target=login_refresh_loop,
         args=(session, init_data, device_id, tg_id),
+        daemon=True,
+    ).start()
+
+    # Khởi chạy luồng Auto Task song song
+    threading.Thread(
+        target=task_loop,
+        args=(session,),
         daemon=True,
     ).start()
 
@@ -591,6 +696,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="status-line" id="statusLine"></div>
+    <div class="status-line" id="taskStatusLine" style="color: var(--gold); margin-top: 4px;"></div>
 
     <hr style="margin:25px 0;border:0;border-top:1px solid #33291d;">
 
@@ -825,6 +931,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById('vongLap').textContent = data.vong_lap ?? '–';
       document.getElementById('uptime').textContent = fmtUptime(data.uptime_seconds);
       document.getElementById('statusLine').textContent = data.bot_last_status ?? '';
+      document.getElementById('taskStatusLine').textContent = data.task_status ? `Task: ${data.task_status}` : '';
 
       const reqCount = data.request_count ?? 0;
       const threshold = data.threshold_requests ?? 300;
@@ -995,6 +1102,7 @@ def api_status():
         "threshold_requests": snapshot["threshold_requests"],
         "ban_level": snapshot["ban_level"],
         "is_running": snapshot["is_running"],
+        "task_status": snapshot.get("task_status", ""),
         "seconds_since_login_refresh": (time.time() - last_refresh) if last_refresh else None,
         "uptime_seconds": int(time.time() - snapshot["started_at"]),
     }
