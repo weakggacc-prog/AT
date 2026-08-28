@@ -74,6 +74,7 @@ bot_state = {
     "last_login_refresh": None,
     "is_running": False,
     "task_status": "Chưa chạy",
+    "task_wait_until": 0,
 }
 state_lock = threading.Lock()
 bot_thread = None
@@ -240,6 +241,7 @@ def task_loop(session):
             print(f"[AutoTask] {msg}")
             with state_lock:
                 bot_state["task_status"] = msg
+                bot_state["task_wait_until"] = 0
             
             send_task_action(session, "start_task", task_id)
             
@@ -249,12 +251,14 @@ def task_loop(session):
                 time.sleep(0.1)
 
         # 2. Chờ 60 giây trước khi claim
-        msg = "Đã start đủ 4 task, đang chờ 60 giây..."
+        wait_seconds = 60
+        msg = "Đã start đủ 4 task, đang chờ 60s..."
         print(f"[AutoTask] {msg}")
         with state_lock:
             bot_state["task_status"] = msg
+            bot_state["task_wait_until"] = time.time() + wait_seconds
 
-        for _ in range(600):
+        for _ in range(wait_seconds * 10):
             if stop_event.is_set():
                 return
             time.sleep(0.1)
@@ -269,6 +273,7 @@ def task_loop(session):
             print(f"[AutoTask] {msg}")
             with state_lock:
                 bot_state["task_status"] = msg
+                bot_state["task_wait_until"] = 0
 
             resp = send_task_action(session, "claim_task", task_id)
 
@@ -276,7 +281,6 @@ def task_loop(session):
             if resp and resp.status_code == 200:
                 try:
                     res_data = resp.json()
-                    # Kiểm tra xem Server trả về status success hoặc có nhận reward không
                     if res_data.get("status") == "success" or res_data.get("reward") or res_data.get("success") is True:
                         is_success = True
                 except Exception:
@@ -293,24 +297,26 @@ def task_loop(session):
 
         # 4. Phân nhánh thời gian chờ tùy thuộc vào kết quả Claim
         if all_claimed_successfully:
-            # Thành công hết -> Nghỉ 2 tiếng (7200s)
-            msg = "Đã claim 4 task thành công! Chờ hồi nhiệm vụ 2 tiếng..."
+            wait_seconds = 7210
+            msg = "Đã claim 4 task thành công! Chờ hồi nhiệm vụ..."
             print(f"[AutoTask] {msg}")
             with state_lock:
                 bot_state["task_status"] = msg
+                bot_state["task_wait_until"] = time.time() + wait_seconds
 
-            for _ in range(72100): # 7200s * 10
+            for _ in range(wait_seconds * 10):
                 if stop_event.is_set():
                     return
                 time.sleep(0.1)
         else:
-            # Thất bại ít nhất 1 task -> Thử lại sau 15 phút (900s)
-            msg = "Có task claim thất bại. Sẽ thử lại sau 15 phút..."
+            wait_seconds = 870
+            msg = "Có task claim thất bại. Sẽ thử lại..."
             print(f"[AutoTask] {msg}")
             with state_lock:
                 bot_state["task_status"] = msg
+                bot_state["task_wait_until"] = time.time() + wait_seconds
 
-            for _ in range(9000): # 900s * 10
+            for _ in range(wait_seconds * 10):
                 if stop_event.is_set():
                     return
                 time.sleep(0.1)
@@ -466,7 +472,6 @@ def bot_loop():
                         "ban_level": 0,
                     })
 
-                # Xử lý khi bị lỗi 401/403 hoặc server yêu cầu session (Re-login và tiếp tục vòng lặp thay vì dừng bot)
                 elif resp.status_code in [401, 403] or "tma_session_required" in resp.text:
                     print(f"[Lượt {vong_lap}] Session hết hạn ({resp.status_code}) - Re-login lại...")
                     set_tma_session("")
@@ -660,6 +665,59 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     font-weight: 500;
     color: var(--text);
   }
+
+  /* KHOẢNG TASK DESIGN MỚI ĐƯỢC NÂNG CẤP DƯỚI ĐÂY */
+  .task-card {
+    background: #16110c;
+    border: 1px solid var(--panel-line);
+    border-radius: 12px;
+    padding: 16px;
+    margin-top: 14px;
+  }
+  .task-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+  }
+  .task-title {
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .task-timer-badge {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--gold-bright);
+    background: rgba(232, 163, 61, 0.12);
+    padding: 3px 8px;
+    border-radius: 6px;
+    display: none;
+  }
+  .task-status-text {
+    font-size: 13px;
+    color: var(--text);
+    font-weight: 500;
+    word-break: break-word;
+  }
+  .task-progress-bar {
+    height: 4px;
+    background: #0d0a07;
+    border-radius: 999px;
+    overflow: hidden;
+    margin-top: 10px;
+    display: none;
+  }
+  .task-progress-fill {
+    height: 100%;
+    background: var(--gold);
+    width: 0%;
+    border-radius: 999px;
+    transition: width 0.3s ease;
+  }
+
   .footer {
     margin-top: 24px;
     text-align: center;
@@ -720,12 +778,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     </div>
 
+    <!-- UI PHẦN TASK ĐƯỢC TỐI ƯU GIAO DIỆN -->
+    <div class="task-card">
+      <div class="task-header">
+        <div class="task-title">Tự động Task</div>
+        <div class="task-timer-badge" id="taskTimerBadge">00:00</div>
+      </div>
+      <div class="task-status-text" id="taskStatusText">Đang tải...</div>
+      <div class="task-progress-bar" id="taskProgressBar">
+        <div class="task-progress-fill" id="taskProgressFill"></div>
+      </div>
+    </div>
+
     <div class="footer">
       cập nhật <span id="lastCheck">–</span> giây trước
     </div>
 
     <div class="status-line" id="statusLine"></div>
-    <div class="status-line" id="taskStatusLine" style="color: var(--gold); margin-top: 4px;"></div>
 
     <hr style="margin:25px 0;border:0;border-top:1px solid #33291d;">
 
@@ -938,6 +1007,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   let ratePerSec = 0;
   let lastServerUpdate = Date.now();
 
+  let taskWaitUntil = 0;
+  let taskStatus = "";
+  let taskTotalWait = 0;
+
   function fmtUptime(sec) {
     if (sec == null) return "–";
     const h = Math.floor(sec / 3600);
@@ -946,6 +1019,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     if (h > 0) return `${h}h ${m}m`;
     if (m > 0) return `${m}m ${s}s`;
     return `${s}s`;
+  }
+
+  function fmtTimer(sec) {
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = Math.floor(sec % 60);
+    if (h > 0) {
+      return `${h}h ${m.toString().padStart(2, '0')}m ${s.toString().padStart(2, '0')}s`;
+    }
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
   }
 
   async function poll() {
@@ -960,7 +1043,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById('vongLap').textContent = data.vong_lap ?? '–';
       document.getElementById('uptime').textContent = fmtUptime(data.uptime_seconds);
       document.getElementById('statusLine').textContent = data.bot_last_status ?? '';
-      document.getElementById('taskStatusLine').textContent = data.task_status ? `Task: ${data.task_status}` : '';
+
+      // Cập nhật biến trạng thái Task
+      taskStatus = data.task_status || "Chưa chạy";
+      const newWaitUntil = data.task_wait_until || 0;
+      if (newWaitUntil !== taskWaitUntil && newWaitUntil > (Date.now() / 1000)) {
+        taskWaitUntil = newWaitUntil;
+        taskTotalWait = taskWaitUntil - (Date.now() / 1000);
+      } else if (newWaitUntil === 0) {
+        taskWaitUntil = 0;
+        taskTotalWait = 0;
+      }
 
       const reqCount = data.request_count ?? 0;
       const threshold = data.threshold_requests ?? 300;
@@ -1096,6 +1189,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     document.getElementById('rewardNumber').textContent = projected.toFixed(4);
     document.getElementById('lastCheck').textContent = elapsed.toFixed(0);
 
+    // Cập nhật UI Bộ đếm ngược Task đẹp mắt
+    const taskStatusEl = document.getElementById('taskStatusText');
+    const taskBadgeEl = document.getElementById('taskTimerBadge');
+    const taskBarEl = document.getElementById('taskProgressBar');
+    const taskFillEl = document.getElementById('taskProgressFill');
+
+    taskStatusEl.textContent = taskStatus;
+
+    if (taskWaitUntil > 0) {
+      const remainSec = Math.max(0, Math.ceil(taskWaitUntil - (Date.now() / 1000)));
+      if (remainSec > 0) {
+        taskBadgeEl.style.display = 'inline-block';
+        taskBadgeEl.textContent = fmtTimer(remainSec);
+
+        if (taskTotalWait > 0) {
+          taskBarEl.style.display = 'block';
+          const pct = Math.min(100, Math.max(0, ((taskTotalWait - remainSec) / taskTotalWait) * 100));
+          taskFillEl.style.width = pct + '%';
+        } else {
+          taskBarEl.style.display = 'none';
+        }
+      } else {
+        taskBadgeEl.style.display = 'none';
+        taskBarEl.style.display = 'none';
+      }
+    } else {
+      taskBadgeEl.style.display = 'none';
+      taskBarEl.style.display = 'none';
+    }
+
     requestAnimationFrame(tick);
   }
 
@@ -1132,6 +1255,7 @@ def api_status():
         "ban_level": snapshot["ban_level"],
         "is_running": snapshot["is_running"],
         "task_status": snapshot.get("task_status", ""),
+        "task_wait_until": snapshot.get("task_wait_until", 0),
         "seconds_since_login_refresh": (time.time() - last_refresh) if last_refresh else None,
         "uptime_seconds": int(time.time() - snapshot["started_at"]),
     }
@@ -1193,7 +1317,6 @@ def admin_save_config():
 @app.route("/api/external/update-config", methods=["POST", "OPTIONS"])
 def external_update_config():
     """API cho Userscripts/Extension gửi initData tự động qua POST"""
-    # Xử lý preflight request của CORS
     if request.method == "OPTIONS":
         response = jsonify({"status": "ok"})
         response.headers.add("Access-Control-Allow-Origin", "*")
