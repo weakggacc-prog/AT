@@ -230,9 +230,9 @@ def send_task_action(session, action, task_id):
 
 
 def task_loop(session):
-    """Luồng phụ chạy tự động 4 task theo chu kỳ"""
+    """Luồng phụ chạy tự động 4 task theo chu kỳ với kiểm tra response và retry/chờ hồi đầy đủ"""
     while not stop_event.is_set():
-        # 1. Start 4 task (sau mỗi task nghỉ 4s)
+        # 1. Start 4 task
         for i, task_id in enumerate(TASK_LIST, start=1):
             if stop_event.is_set():
                 return
@@ -243,7 +243,7 @@ def task_loop(session):
             
             send_task_action(session, "start_task", task_id)
             
-            for _ in range(40): # Chờ 4 giây
+            for _ in range(40): # Chờ 4 giây giữa các task
                 if stop_event.is_set():
                     return
                 time.sleep(0.1)
@@ -259,7 +259,9 @@ def task_loop(session):
                 return
             time.sleep(0.1)
 
-        # 3. Claim 4 task (sau mỗi task nghỉ 4s)
+        # 3. Claim 4 task và kiểm tra kết quả
+        all_claimed_successfully = True
+
         for i, task_id in enumerate(TASK_LIST, start=1):
             if stop_event.is_set():
                 return
@@ -268,23 +270,50 @@ def task_loop(session):
             with state_lock:
                 bot_state["task_status"] = msg
 
-            send_task_action(session, "claim_task", task_id)
+            resp = send_task_action(session, "claim_task", task_id)
 
-            for _ in range(40): # Chờ 4 giây
+            is_success = False
+            if resp and resp.status_code == 200:
+                try:
+                    res_data = resp.json()
+                    # Kiểm tra xem Server trả về status success hoặc có nhận reward không
+                    if res_data.get("status") == "success" or res_data.get("reward") or res_data.get("success") is True:
+                        is_success = True
+                except Exception:
+                    pass
+
+            if not is_success:
+                all_claimed_successfully = False
+                print(f"[AutoTask] Task {task_id} claim THẤT BẠI!")
+
+            for _ in range(40): # Chờ 4 giây giữa các task
                 if stop_event.is_set():
                     return
                 time.sleep(0.1)
 
-        # 4. Cooldown 15 phút (900s)
-        msg = "Đã claim 4 task thành công. Cooldown 15 phút..."
-        print(f"[AutoTask] {msg}")
-        with state_lock:
-            bot_state["task_status"] = msg
+        # 4. Phân nhánh thời gian chờ tùy thuộc vào kết quả Claim
+        if all_claimed_successfully:
+            # Thành công hết -> Nghỉ 2 tiếng (7200s)
+            msg = "Đã claim 4 task thành công! Chờ hồi nhiệm vụ 2 tiếng..."
+            print(f"[AutoTask] {msg}")
+            with state_lock:
+                bot_state["task_status"] = msg
 
-        for _ in range(9000):
-            if stop_event.is_set():
-                return
-            time.sleep(0.1)
+            for _ in range(72000): # 7200s * 10
+                if stop_event.is_set():
+                    return
+                time.sleep(0.1)
+        else:
+            # Thất bại ít nhất 1 task -> Thử lại sau 15 phút (900s)
+            msg = "Có task claim thất bại. Sẽ thử lại sau 15 phút..."
+            print(f"[AutoTask] {msg}")
+            with state_lock:
+                bot_state["task_status"] = msg
+
+            for _ in range(9000): # 900s * 10
+                if stop_event.is_set():
+                    return
+                time.sleep(0.1)
 
 
 def login_refresh_loop(session, init_data, device_id, tg_id):
