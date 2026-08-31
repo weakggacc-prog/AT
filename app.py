@@ -40,11 +40,9 @@ USAGE_WARN_RATIO = 0.75
 USAGE_DANGER_RATIO = 0.9
 COOLDOWN_SECONDS = 120
 
-# Khoảng cách giữa các lần chủ động login lại (không phải do lỗi, mà làm mới định kỳ)
-LOGIN_REFRESH_MIN = 7 * 60   # 7 phút
-LOGIN_REFRESH_MAX = 10 * 60  # 10 phút
+LOGIN_REFRESH_MIN = 7 * 60
+LOGIN_REFRESH_MAX = 10 * 60
 
-# Danh sách 4 task
 TASK_LIST = [
     "youtube_like_comment",
     "twitter_retweet",
@@ -52,15 +50,13 @@ TASK_LIST = [
     "telegram_react_latest"
 ]
 
-# Cấu hình runtime (cho phép hot reload không cần restart Render)
 runtime_config = {
     "INIT_DATA": os.environ.get("INIT_DATA", "").strip(),
     "DEVICE_ID": os.environ.get("DEVICE_ID", "").strip(),
-    "TMA_SESSION": ""  # Lưu session token trong RAM
+    "TMA_SESSION": ""
 }
 config_lock = threading.Lock()
 
-# Trạng thái bot, để lộ ra qua route "/" cho dễ theo dõi từ xa
 bot_state = {
     "started_at": time.time(),
     "last_loop": None,
@@ -166,7 +162,6 @@ def login(session, init_data, device_id, tg_id):
         return False, None
     data = resp.json()
 
-    # Bổ sung lưu TMA Session token khi Login thành công
     tma_token = resp.headers.get("x-atf-tma-session") or data.get("session_token") or data.get("tma_session")
     if tma_token:
         set_tma_session(tma_token)
@@ -182,8 +177,7 @@ def login(session, init_data, device_id, tg_id):
 def activate_boost(session, init_data, device_id, tg_id, display_preview):
     headers = dict(COMMON_HEADERS_TEMPLATE)
     headers["X-Telegram-Init-Data"] = init_data
-    
-    # Kèm thêm TMA Session vào header nếu có
+
     tma_session = get_tma_session()
     if tma_session:
         headers["x-atf-tma-session"] = tma_session
@@ -207,7 +201,7 @@ def send_task_action(session, action, task_id):
 
     headers = dict(COMMON_HEADERS_TEMPLATE)
     headers["X-Telegram-Init-Data"] = init_data
-    
+
     tma_session = get_tma_session()
     if tma_session:
         headers["x-atf-tma-session"] = tma_session
@@ -233,7 +227,6 @@ def send_task_action(session, action, task_id):
 def task_loop(session):
     """Luồng phụ chạy tự động 4 task theo chu kỳ với kiểm tra response và retry/chờ hồi đầy đủ"""
     while not stop_event.is_set():
-        # 1. Start 4 task
         for i, task_id in enumerate(TASK_LIST, start=1):
             if stop_event.is_set():
                 return
@@ -242,15 +235,14 @@ def task_loop(session):
             with state_lock:
                 bot_state["task_status"] = msg
                 bot_state["task_wait_until"] = 0
-            
+
             send_task_action(session, "start_task", task_id)
-            
-            for _ in range(40): # Chờ 4 giây giữa các task
+
+            for _ in range(40):
                 if stop_event.is_set():
                     return
                 time.sleep(0.1)
 
-        # 2. Chờ 60 giây trước khi claim
         wait_seconds = 60
         msg = "Đã start đủ 4 task, đang chờ 60s..."
         print(f"[AutoTask] {msg}")
@@ -263,7 +255,6 @@ def task_loop(session):
                 return
             time.sleep(0.1)
 
-        # 3. Claim 4 task và kiểm tra kết quả
         all_claimed_successfully = True
 
         for i, task_id in enumerate(TASK_LIST, start=1):
@@ -290,12 +281,11 @@ def task_loop(session):
                 all_claimed_successfully = False
                 print(f"[AutoTask] Task {task_id} claim THẤT BẠI!")
 
-            for _ in range(40): # Chờ 4 giây giữa các task
+            for _ in range(40):
                 if stop_event.is_set():
                     return
                 time.sleep(0.1)
 
-        # 4. Phân nhánh thời gian chờ tùy thuộc vào kết quả Claim
         if all_claimed_successfully:
             wait_seconds = 7210
             msg = "Đã claim 4 task thành công! Chờ hồi nhiệm vụ..."
@@ -382,7 +372,6 @@ def bot_loop():
         daemon=True,
     ).start()
 
-    # Khởi chạy luồng Auto Task song song
     threading.Thread(
         target=task_loop,
         args=(session,),
@@ -398,6 +387,9 @@ def bot_loop():
             current_device_id = get_device_id()
             current_tg_id = parse_tg_id(current_init_data)
 
+            loop_status_msg = None
+            stop_bot = False
+
             try:
                 resp = activate_boost(session, current_init_data, current_device_id, current_tg_id, pending_reward)
                 if resp.status_code == 200:
@@ -406,88 +398,103 @@ def bot_loop():
 
                     if res_status != "success":
                         failed_status_count += 1
-                        msg = f"Server trả về status '{res_status}' (Lần {failed_status_count}/20)"
-                        print(f"[Lượt {vong_lap}] {msg}")
-                        
+                        loop_status_msg = f"[Lượt {vong_lap}] Server trả về status '{res_status}' (Lần {failed_status_count}/20)"
+                        print(loop_status_msg)
+
                         if failed_status_count >= 20:
-                            stop_msg = f"Server không trả về 'success' 20 lần liên tiếp ('{res_status}'), bot đã dừng."
-                            with state_lock:
-                                bot_state["last_status"] = stop_msg
-                            print(f"[Lượt {vong_lap}] {stop_msg}")
-                            break
+                            loop_status_msg = f"Server không trả về 'success' 20 lần liên tiếp ('{res_status}'), bot đã dừng."
+                            print(f"[Lượt {vong_lap}] {loop_status_msg}")
+                            stop_bot = True
                     else:
                         failed_status_count = 0
 
-                    abuse = data.get("abuse_watch", {})
-                    last_abuse = abuse
-                    try:
-                         new_pending = float(data.get("pending_reward", pending_reward))
-                    except (TypeError, ValueError):
-                         new_pending = pending_reward
+                    if not stop_bot:
+                        abuse = data.get("abuse_watch", {})
+                        last_abuse = abuse
+                        try:
+                            new_pending = float(data.get("pending_reward", pending_reward))
+                        except (TypeError, ValueError):
+                            new_pending = pending_reward
 
-                    if abs(new_pending - last_pending_reward) > EPSILON:
-                        last_pending_reward = new_pending
-                        last_reward_change_time = time.time()
+                        if abs(new_pending - last_pending_reward) > EPSILON:
+                            last_pending_reward = new_pending
+                            last_reward_change_time = time.time()
 
-                    pending_reward = new_pending
+                        pending_reward = new_pending
 
-                    if time.time() - last_reward_change_time > 240:
-                        with state_lock:
-                            bot_state["last_status"] = (
-                                "Pending reward không thay đổi quá 240 giây, bot đã dừng."
-                            )
-                        print(bot_state["last_status"])
-                        break
+                        if time.time() - last_reward_change_time > 240:
+                            loop_status_msg = "Pending reward không thay đổi quá 240 giây, bot đã dừng."
+                            print(loop_status_msg)
+                            stop_bot = True
+                        else:
+                            ban_level = abuse.get("temporary_ban_level", 0)
+                            if ban_level and ban_level > 0:
+                                loop_status_msg = f"BỊ BAN TẠM THỜI level={ban_level}, bot đã dừng"
+                                with state_lock:
+                                    bot_state["ban_level"] = ban_level
+                                print(loop_status_msg)
+                                stop_bot = True
+                            else:
+                                loop_status_msg = (f"[Lượt {vong_lap}] status={res_status} pending_reward={pending_reward} "
+                                                    f"req={abuse.get('request_count')}/{abuse.get('threshold_requests')}")
+                                print(loop_status_msg)
 
-                    ban_level = abuse.get("temporary_ban_level", 0)
-                    if ban_level and ban_level > 0:
-                        with state_lock:
-                            bot_state["last_status"] = f"BỊ BAN TẠM THỜI level={ban_level}, bot đã dừng"
-                            bot_state["ban_level"] = ban_level
-                        print(bot_state["last_status"])
-                        break
+                                now = time.time()
+                                with state_lock:
+                                    prev_loop_time = bot_state.get("last_loop")
+                                    prev_pending = bot_state.get("pending_reward")
+                                rate = 0.0
+                                if prev_loop_time and prev_pending is not None and now > prev_loop_time:
+                                    delta = pending_reward - prev_pending
+                                    elapsed = now - prev_loop_time
+                                    if elapsed > 0 and delta >= 0:
+                                        rate = delta / elapsed
 
-                    status_line = (f"[Lượt {vong_lap}] status={res_status} pending_reward={pending_reward} "
-                                    f"req={abuse.get('request_count')}/{abuse.get('threshold_requests')}")
-                    print(status_line)
-
-                    now = time.time()
-                    prev_loop_time = bot_state.get("last_loop")
-                    prev_pending = bot_state.get("pending_reward")
-                    rate = 0.0
-                    if prev_loop_time and prev_pending is not None and now > prev_loop_time:
-                        delta = pending_reward - prev_pending
-                        elapsed = now - prev_loop_time
-                        if elapsed > 0 and delta >= 0:
-                            rate = delta / elapsed
-
-                    bot_state.update({
-                        "last_status": status_line,
-                        "pending_reward": pending_reward,
-                        "vong_lap": vong_lap,
-                        "last_loop": now,
-                        "rate_per_sec": rate,
-                        "request_count": abuse.get("request_count"),
-                        "threshold_requests": abuse.get("threshold_requests"),
-                        "ban_level": 0,
-                    })
+                                with state_lock:
+                                    bot_state.update({
+                                        "pending_reward": pending_reward,
+                                        "rate_per_sec": rate,
+                                        "request_count": abuse.get("request_count"),
+                                        "threshold_requests": abuse.get("threshold_requests"),
+                                        "ban_level": 0,
+                                    })
 
                 elif resp.status_code in [401, 403] or "tma_session_required" in resp.text:
-                    print(f"[Lượt {vong_lap}] Session hết hạn ({resp.status_code}) - Re-login lại...")
+                    loop_status_msg = f"[Lượt {vong_lap}] Session hết hạn ({resp.status_code}) - đang re-login..."
+                    print(loop_status_msg)
                     set_tma_session("")
                     ok, pending_reward = login(session, current_init_data, current_device_id, current_tg_id)
                     if not ok:
-                        print(f"[Lượt {vong_lap}] Re-login thất bại, tạm chờ 10s...")
-                        time.sleep(10)
+                        loop_status_msg = f"[Lượt {vong_lap}] Re-login thất bại, tạm chờ 10s..."
+                        print(loop_status_msg)
+                        for _ in range(100):
+                            if stop_event.is_set():
+                                break
+                            time.sleep(0.1)
+                    else:
+                        loop_status_msg = f"[Lượt {vong_lap}] Re-login thành công."
                 else:
-                    print(f"[Lượt {vong_lap}] Mã lỗi: {resp.status_code} - {resp.text[:200]}")
+                    loop_status_msg = f"[Lượt {vong_lap}] Mã lỗi: {resp.status_code} - {resp.text[:200]}"
+                    print(loop_status_msg)
 
             except Exception as e:
-                print(f"Lỗi kết nối: {e}")
+                loop_status_msg = f"[Lượt {vong_lap}] Lỗi kết nối: {e}"
+                print(loop_status_msg)
+
+            # Luôn cập nhật state mỗi vòng lặp, kể cả khi lỗi/re-login,
+            # để dashboard không bị "đứng hình" rồi giật số.
+            with state_lock:
+                bot_state["vong_lap"] = vong_lap
+                bot_state["last_loop"] = time.time()
+                if loop_status_msg:
+                    bot_state["last_status"] = loop_status_msg
+
+            if stop_bot:
+                break
 
             base_wait = random.uniform(MIN_INTERVAL, MAX_INTERVAL)
             cho = compute_adaptive_wait(last_abuse, base_wait)
-            
+
             for _ in range(int(cho * 10)):
                 if stop_event.is_set():
                     break
@@ -666,7 +673,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     color: var(--text);
   }
 
-  /* KHOẢNG TASK DESIGN MỚI ĐƯỢC NÂNG CẤP DƯỚI ĐÂY */
   .task-card {
     background: #16110c;
     border: 1px solid var(--panel-line);
@@ -778,7 +784,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     </div>
 
-    <!-- UI PHẦN TASK ĐƯỢC TỐI ƯU GIAO DIỆN -->
     <div class="task-card">
       <div class="task-header">
         <div class="task-title">Tự động Task</div>
@@ -799,8 +804,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <hr style="margin:25px 0;border:0;border-top:1px solid #33291d;">
 
     <div id="adminPanel">
-
-      <!-- LOGIN -->
 
       <div id="loginBox">
 
@@ -840,8 +843,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         </button>
 
       </div>
-
-      <!-- ADMIN -->
 
       <div id="adminBox" style="display:none;">
 
@@ -1044,7 +1045,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       document.getElementById('uptime').textContent = fmtUptime(data.uptime_seconds);
       document.getElementById('statusLine').textContent = data.bot_last_status ?? '';
 
-      // Cập nhật biến trạng thái Task
       taskStatus = data.task_status || "Chưa chạy";
       const newWaitUntil = data.task_wait_until || 0;
       if (newWaitUntil !== taskWaitUntil && newWaitUntil > (Date.now() / 1000)) {
@@ -1189,7 +1189,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     document.getElementById('rewardNumber').textContent = projected.toFixed(4);
     document.getElementById('lastCheck').textContent = elapsed.toFixed(0);
 
-    // Cập nhật UI Bộ đếm ngược Task đẹp mắt
     const taskStatusEl = document.getElementById('taskStatusText');
     const taskBadgeEl = document.getElementById('taskTimerBadge');
     const taskBarEl = document.getElementById('taskProgressBar');
@@ -1307,7 +1306,7 @@ def admin_save_config():
             runtime_config["DEVICE_ID"] = new_device_id
         if new_init_data:
             runtime_config["INIT_DATA"] = new_init_data
-            runtime_config["TMA_SESSION"] = ""  # Reset session cũ khi đổi init_data mới
+            runtime_config["TMA_SESSION"] = ""
 
     return jsonify({
         "success": True,
@@ -1326,12 +1325,12 @@ def external_update_config():
 
     data = request.get_json(force=True) or {}
     password = data.get("password", "")
-    
+
     if password != ADMIN_PASSWORD:
         resp = jsonify({"success": False, "message": "Sai Mật khẩu Admin"})
         resp.headers.add("Access-Control-Allow-Origin", "*")
         return resp, 401
-        
+
     new_device_id = data.get("device_id", "").strip()
     new_init_data = data.get("init_data", "").strip()
 
@@ -1344,7 +1343,7 @@ def external_update_config():
         if new_device_id:
             runtime_config["DEVICE_ID"] = new_device_id
         runtime_config["INIT_DATA"] = new_init_data
-        runtime_config["TMA_SESSION"] = ""  # Reset session cũ
+        runtime_config["TMA_SESSION"] = ""
 
     print(f"[AUTO-HOOK] Tự động đẩy initData mới thành công!")
     resp = jsonify({"success": True, "message": "Đã tự động sync cấu hình thành công!"})
