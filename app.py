@@ -34,10 +34,10 @@ COMMON_HEADERS_TEMPLATE = {
     "Sec-Fetch-Site": "same-origin",
 }
 
-MIN_INTERVAL = 8.1
-MAX_INTERVAL = 9.5
-USAGE_WARN_RATIO = 0.6
-USAGE_DANGER_RATIO = 0.8
+MIN_INTERVAL = 8.3
+MAX_INTERVAL = 9.0
+USAGE_WARN_RATIO = 0.75
+USAGE_DANGER_RATIO = 0.9
 COOLDOWN_SECONDS = 120
 
 LOGIN_REFRESH_MIN = 7 * 60
@@ -61,6 +61,7 @@ bot_state = {
     "started_at": time.time(),
     "last_loop": None,
     "last_status": "starting",
+    "status_category": "starting",
     "pending_reward": None,
     "vong_lap": 0,
     "rate_per_sec": 0.0,
@@ -75,6 +76,54 @@ bot_state = {
 state_lock = threading.Lock()
 bot_thread = None
 stop_event = threading.Event()
+
+# Nhãn ngắn cho từng category, dùng cho pill trên dashboard.
+# Màu sắc tương ứng được định nghĩa ở phía JS/CSS (CATEGORY_STYLES).
+STATUS_LABELS = {
+    "starting": "Đang khởi động",
+    "success": "Success",
+    "busy": "Busy",
+    "banned": "Banned",
+    "session_expired": "Renewing",
+    "server_error": "Server error",
+    "conn_error": "Mất kết nối",
+    "stopped": "Đã dừng",
+    "unknown": "Unknown",
+}
+
+
+def classify_activate_response(resp):
+    """Chuẩn hoá mọi response của activate_boost về (category, data|None).
+
+    Không dựa mỗi vào status_code: luôn thử parse JSON trước, vì server có
+    thể trả JSON hợp lệ ngay cả với status_code lỗi (vd 429 kèm body JSON
+    {"status":"busy",...}), hoặc trả HTML rác (nginx 429/502) mà không có
+    JSON nào để đọc.
+    """
+    try:
+        data = resp.json()
+    except Exception:
+        data = None
+
+    body_status = data.get("status") if isinstance(data, dict) else None
+
+    if resp.status_code == 200 and data is not None:
+        if body_status == "success":
+            return "success", data
+        if body_status == "busy":
+            return "busy", data
+        return "unknown", data
+
+    # Không phải 200: ưu tiên đọc field "status" trong JSON nếu có
+    if body_status == "busy":
+        return "busy", data
+    if resp.status_code == 429:
+        return "busy", data
+    if resp.status_code in (401, 403):
+        return "session_expired", data
+    if 500 <= resp.status_code < 600:
+        return "server_error", data
+    return "server_error", data
 
 def get_device_id():
     """Lấy device_id từ runtime_config hoặc biến môi trường."""
@@ -387,79 +436,88 @@ def bot_loop():
             current_device_id = get_device_id()
             current_tg_id = parse_tg_id(current_init_data)
 
-            loop_status_msg = None
+            loop_status_msg = None   # chi tiết đầy đủ -> chỉ in console/log
+            status_category = None   # nhãn ngắn -> hiện lên pill dashboard
             stop_bot = False
 
             try:
                 resp = activate_boost(session, current_init_data, current_device_id, current_tg_id, pending_reward)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    res_status = data.get("status")
+                status_category, data = classify_activate_response(resp)
 
-                    if res_status != "success":
-                        failed_status_count += 1
-                        loop_status_msg = f"[Lượt {vong_lap}] Server trả về status '{res_status}' (Lần {failed_status_count}/20)"
+                if status_category == "success":
+                    failed_status_count = 0
+                elif status_category == "unknown":
+                    # 200 nhưng status lạ (không phải success/busy) -> vẫn tính là 1 lần "không success"
+                    failed_status_count += 1
+                    body_status = data.get("status") if isinstance(data, dict) else None
+                    loop_status_msg = f"[Lượt {vong_lap}] Server trả về status '{body_status}' (Lần {failed_status_count}/20)"
+                    print(loop_status_msg)
+                    if failed_status_count >= 20:
+                        loop_status_msg = f"Server không trả về 'success' 20 lần liên tiếp ('{body_status}'), bot đã dừng."
+                        print(f"[Lượt {vong_lap}] {loop_status_msg}")
+                        stop_bot = True
+
+                if status_category in ("success", "unknown") and not stop_bot and isinstance(data, dict):
+                    abuse = data.get("abuse_watch", {})
+                    last_abuse = abuse
+                    try:
+                        new_pending = float(data.get("pending_reward", pending_reward))
+                    except (TypeError, ValueError):
+                        new_pending = pending_reward
+
+                    if abs(new_pending - last_pending_reward) > EPSILON:
+                        last_pending_reward = new_pending
+                        last_reward_change_time = time.time()
+
+                    pending_reward = new_pending
+
+                    if time.time() - last_reward_change_time > 240:
+                        loop_status_msg = "Pending reward không thay đổi quá 240 giây, bot đã dừng."
                         print(loop_status_msg)
-
-                        if failed_status_count >= 20:
-                            loop_status_msg = f"Server không trả về 'success' 20 lần liên tiếp ('{res_status}'), bot đã dừng."
-                            print(f"[Lượt {vong_lap}] {loop_status_msg}")
-                            stop_bot = True
+                        stop_bot = True
                     else:
-                        failed_status_count = 0
-
-                    if not stop_bot:
-                        abuse = data.get("abuse_watch", {})
-                        last_abuse = abuse
-                        try:
-                            new_pending = float(data.get("pending_reward", pending_reward))
-                        except (TypeError, ValueError):
-                            new_pending = pending_reward
-
-                        if abs(new_pending - last_pending_reward) > EPSILON:
-                            last_pending_reward = new_pending
-                            last_reward_change_time = time.time()
-
-                        pending_reward = new_pending
-
-                        if time.time() - last_reward_change_time > 240:
-                            loop_status_msg = "Pending reward không thay đổi quá 240 giây, bot đã dừng."
+                        ban_level = abuse.get("temporary_ban_level", 0)
+                        if ban_level and ban_level > 0:
+                            status_category = "banned"
+                            loop_status_msg = f"BỊ BAN TẠM THỜI level={ban_level}, bot đã dừng"
+                            with state_lock:
+                                bot_state["ban_level"] = ban_level
                             print(loop_status_msg)
                             stop_bot = True
                         else:
-                            ban_level = abuse.get("temporary_ban_level", 0)
-                            if ban_level and ban_level > 0:
-                                loop_status_msg = f"BỊ BAN TẠM THỜI level={ban_level}, bot đã dừng"
-                                with state_lock:
-                                    bot_state["ban_level"] = ban_level
-                                print(loop_status_msg)
-                                stop_bot = True
-                            else:
-                                loop_status_msg = (f"[Lượt {vong_lap}] status={res_status} pending_reward={pending_reward} "
-                                                    f"req={abuse.get('request_count')}/{abuse.get('threshold_requests')}")
-                                print(loop_status_msg)
+                            res_status = data.get("status")
+                            loop_status_msg = (f"[Lượt {vong_lap}] status={res_status} pending_reward={pending_reward} "
+                                                f"req={abuse.get('request_count')}/{abuse.get('threshold_requests')}")
+                            print(loop_status_msg)
 
-                                now = time.time()
-                                with state_lock:
-                                    prev_loop_time = bot_state.get("last_loop")
-                                    prev_pending = bot_state.get("pending_reward")
-                                rate = 0.0
-                                if prev_loop_time and prev_pending is not None and now > prev_loop_time:
-                                    delta = pending_reward - prev_pending
-                                    elapsed = now - prev_loop_time
-                                    if elapsed > 0 and delta >= 0:
-                                        rate = delta / elapsed
+                            now = time.time()
+                            with state_lock:
+                                prev_loop_time = bot_state.get("last_loop")
+                                prev_pending = bot_state.get("pending_reward")
+                            rate = 0.0
+                            if prev_loop_time and prev_pending is not None and now > prev_loop_time:
+                                delta = pending_reward - prev_pending
+                                elapsed = now - prev_loop_time
+                                if elapsed > 0 and delta >= 0:
+                                    rate = delta / elapsed
 
-                                with state_lock:
-                                    bot_state.update({
-                                        "pending_reward": pending_reward,
-                                        "rate_per_sec": rate,
-                                        "request_count": abuse.get("request_count"),
-                                        "threshold_requests": abuse.get("threshold_requests"),
-                                        "ban_level": 0,
-                                    })
+                            with state_lock:
+                                bot_state.update({
+                                    "pending_reward": pending_reward,
+                                    "rate_per_sec": rate,
+                                    "request_count": abuse.get("request_count"),
+                                    "threshold_requests": abuse.get("threshold_requests"),
+                                    "ban_level": 0,
+                                })
 
-                elif resp.status_code in [401, 403] or "tma_session_required" in resp.text:
+                elif status_category == "busy":
+                    retry_after = data.get("retry_after") if isinstance(data, dict) else None
+                    loop_status_msg = f"[Lượt {vong_lap}] Server bận (429/busy)"
+                    if retry_after is not None:
+                        loop_status_msg += f", retry_after={retry_after}"
+                    print(loop_status_msg)
+
+                elif status_category == "session_expired":
                     loop_status_msg = f"[Lượt {vong_lap}] Session hết hạn ({resp.status_code}) - đang re-login..."
                     print(loop_status_msg)
                     set_tma_session("")
@@ -473,11 +531,14 @@ def bot_loop():
                             time.sleep(0.1)
                     else:
                         loop_status_msg = f"[Lượt {vong_lap}] Re-login thành công."
-                else:
-                    loop_status_msg = f"[Lượt {vong_lap}] Mã lỗi: {resp.status_code} - {resp.text[:200]}"
+
+                elif status_category == "server_error":
+                    snippet = (resp.text or "")[:200]
+                    loop_status_msg = f"[Lượt {vong_lap}] Mã lỗi: {resp.status_code} - {snippet}"
                     print(loop_status_msg)
 
             except Exception as e:
+                status_category = "conn_error"
                 loop_status_msg = f"[Lượt {vong_lap}] Lỗi kết nối: {e}"
                 print(loop_status_msg)
 
@@ -486,6 +547,8 @@ def bot_loop():
             with state_lock:
                 bot_state["vong_lap"] = vong_lap
                 bot_state["last_loop"] = time.time()
+                if status_category:
+                    bot_state["status_category"] = status_category
                 if loop_status_msg:
                     bot_state["last_status"] = loop_status_msg
 
@@ -503,6 +566,7 @@ def bot_loop():
     finally:
         with state_lock:
             bot_state["is_running"] = False
+            bot_state["status_category"] = "stopped"
             if stop_event.is_set():
                 bot_state["last_status"] = "Đã dừng bot khẩn cấp (Emergency Stop)."
 
@@ -551,6 +615,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     --success: #4caf7d;
     --warn: #d98f2b;
     --danger: #e1543d;
+    --info: #4a90d9;
   }
   * { box-sizing: border-box; }
   body {
@@ -731,12 +796,23 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     font-size: 11px;
     color: var(--muted);
   }
-  .status-line {
-    margin-top: 6px;
+  .status-pill-wrap {
+    margin-top: 12px;
+    display: flex;
+    justify-content: center;
+  }
+  .status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: 'IBM Plex Mono', monospace;
     font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    padding: 5px 12px;
+    border-radius: 999px;
+    background: rgba(156, 143, 124, 0.14);
     color: var(--muted);
-    text-align: center;
-    word-break: break-word;
   }
 </style>
 </head>
@@ -799,7 +875,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       cập nhật <span id="lastCheck">–</span> giây trước
     </div>
 
-    <div class="status-line" id="statusLine"></div>
+    <div class="status-pill-wrap">
+      <span class="status-pill" id="reqStatusPill">–</span>
+    </div>
 
     <hr style="margin:25px 0;border:0;border-top:1px solid #33291d;">
 
@@ -1012,6 +1090,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   let taskStatus = "";
   let taskTotalWait = 0;
 
+  const CATEGORY_STYLES = {
+    success:         { bg: 'rgba(76, 175, 125, 0.14)',  color: 'var(--success)' },
+    busy:            { bg: 'rgba(217, 143, 43, 0.16)',  color: 'var(--warn)' },
+    banned:          { bg: 'rgba(225, 84, 61, 0.20)',   color: 'var(--danger)' },
+    session_expired: { bg: 'rgba(74, 144, 217, 0.16)',  color: 'var(--info)' },
+    server_error:    { bg: 'rgba(225, 84, 61, 0.14)',   color: 'var(--danger)' },
+    conn_error:      { bg: 'rgba(156, 143, 124, 0.18)', color: 'var(--muted)' },
+    stopped:         { bg: 'rgba(156, 143, 124, 0.14)', color: 'var(--muted)' },
+    unknown:         { bg: 'rgba(217, 143, 43, 0.14)',  color: 'var(--warn)' },
+    starting:        { bg: 'rgba(156, 143, 124, 0.14)', color: 'var(--muted)' },
+  };
+
   function fmtUptime(sec) {
     if (sec == null) return "–";
     const h = Math.floor(sec / 3600);
@@ -1043,7 +1133,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
       document.getElementById('vongLap').textContent = data.vong_lap ?? '–';
       document.getElementById('uptime').textContent = fmtUptime(data.uptime_seconds);
-      document.getElementById('statusLine').textContent = data.bot_last_status ?? '';
+
+      const reqPill = document.getElementById('reqStatusPill');
+      const category = data.status_category || 'unknown';
+      const style = CATEGORY_STYLES[category] || CATEGORY_STYLES.unknown;
+      reqPill.textContent = data.status_label || category;
+      reqPill.style.background = style.bg;
+      reqPill.style.color = style.color;
 
       taskStatus = data.task_status || "Chưa chạy";
       const newWaitUntil = data.task_wait_until || 0;
@@ -1243,9 +1339,12 @@ def api_status():
     with state_lock:
         last_refresh = bot_state.get("last_login_refresh")
         snapshot = dict(bot_state)
+    status_category = snapshot.get("status_category", "unknown")
     return {
         "status": "alive",
         "bot_last_status": snapshot["last_status"],
+        "status_category": status_category,
+        "status_label": STATUS_LABELS.get(status_category, status_category),
         "pending_reward": snapshot["pending_reward"],
         "rate_per_sec": snapshot["rate_per_sec"],
         "vong_lap": snapshot["vong_lap"],
